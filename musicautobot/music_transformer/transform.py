@@ -1,4 +1,3 @@
-from __future__ import annotations
 from ..numpy_encode import *
 import numpy as np
 from enum import Enum
@@ -24,6 +23,7 @@ class MusicItem():
         return cls.from_stream(file2stream(midi_file), vocab)
     @classmethod
     def from_stream(cls, stream, vocab):
+        if not isinstance(stream, music21.stream.Score): stream = stream.voicesToParts()
         chordarr = stream2chordarr(stream) # 2.
         npenc = chordarr2npenc(chordarr) # 3.
         return cls.from_npenc(npenc, vocab, stream)
@@ -72,12 +72,12 @@ class MusicItem():
         return partial(type(self), vocab=self.vocab)
 
     def trim_to_beat(self, beat, include_last_sep=False):
-        return self.new(trim_to_beat(self.data, self.position, beat, include_last_sep))
+        return self.new(trim_to_beat(self.data, self.position, self.vocab, beat, include_last_sep))
     
     def transpose(self, interval):
         return self.new(tfm_transpose(self.data, interval, self.vocab), position=self._position)
     
-    def append(self, item:MusicItem):
+    def append(self, item):
         return self.new(np.concatenate((self.data, item.data), axis=0))
     
     def mask_pitch(self, section=None):
@@ -89,7 +89,7 @@ class MusicItem():
         return self.new(masked_data)
 
     def mask(self, token_range, section_range=None):
-        return mask_section(self.data, self.position, token_range, replace_with=self.vocab.mask_idx, section_range=section_range)
+        return mask_section(self.data, self.position, token_range, self.vocab.mask_idx, section_range=section_range)
     
     def pad_to(self, bptt):
         data = pad_seq(self.data, bptt, self.vocab.pad_idx)
@@ -99,6 +99,13 @@ class MusicItem():
     def split_stream_parts(self):
         self._stream = separate_melody_chord(self.stream)
         return self.stream
+
+    def remove_eos(self):
+        if self.data[-1] == self.vocab.stoi[EOS]: return self.new(self.data, stream=self.stream)
+        return self
+
+    def split_parts(self):
+        return self.new(self.data, stream=separate_melody_chord(self.stream), position=self.position)
         
 def pad_seq(seq, bptt, value):
     pad_len = max(bptt-seq.shape[0], 0)
@@ -183,10 +190,15 @@ def position_enc(idxenc, vocab):
     posenc[sep_idxs+2] = dur_vals
     return posenc.cumsum()
 
-def beat2index(pos, beat, include_last_sep=True, sample_freq=SAMPLE_FREQ, side='left'):
-    cutoff = np.searchsorted(pos, beat * sample_freq, side=side)
-    if include_last_sep or cutoff < 2: return cutoff
-    return cutoff - 2
+def beat2index(idxenc, pos, vocab, beat, include_last_sep=False):
+    cutoff = find_beat(pos, beat)
+    if cutoff < 2: return 2 # always leave starter tokens
+    if len(idxenc) < 2 or include_last_sep: return cutoff
+    if idxenc[cutoff - 2] == vocab.sep_idx: return cutoff - 2
+    return cutoff
+
+def find_beat(pos, beat, sample_freq=SAMPLE_FREQ, side='left'):
+    return np.searchsorted(pos, beat * sample_freq, side=side)
 
 # TRANSFORMS
 
@@ -195,29 +207,25 @@ def tfm_transpose(x, value, vocab):
     x[(x >= vocab.note_range[0]) & (x < vocab.note_range[1])] += value
     return x
 
-def trim_to_beat(idxenc, pos, to_beat=None, include_last_sep=True):
+def trim_to_beat(idxenc, pos, vocab, to_beat=None, include_last_sep=True):
     if to_beat is None: return idxenc
-    cutoff = beat2index(pos, to_beat, include_last_sep)
+    cutoff = beat2index(idxenc, pos, vocab, to_beat, include_last_sep=include_last_sep)
     return idxenc[:cutoff]
-
-def trim_tfm(idxenc, vocab, to_beat=None, trim_sep=True):
-    pos = position_enc(idxenc, vocab)
-    return trim_to_beat(idxenc, pos, to_beat=to_beat, include_last_sep=not trim_sep)
 
 def mask_input(xb, mask_range, replacement_idx):
     xb = xb.copy()
     xb[(xb >= mask_range[0]) & (xb < mask_range[1])] = replacement_idx
     return xb
 
-def mask_section(xb, pos, token_range, replace_with, section_range=None):
+def mask_section(xb, pos, token_range, replacement_idx, section_range=None):
     xb = xb.copy()
     token_mask = (xb >= token_range[0]) & (xb < token_range[1])
 
     if section_range is None: section_range = (None, None)
     section_mask = np.zeros_like(xb, dtype=bool)
-    start_idx = beat2index(pos, section_range[0]) if section_range[0] is not None else 0
-    end_idx = beat2index(pos, section_range[1], include_last_sep=False) if section_range[1] is not None else xb.shape[0]
-    section_mask[start_idx:end_idx+1] = True
+    start_idx = find_beat(pos, section_range[0]) if section_range[0] is not None else 0
+    end_idx = find_beat(pos, section_range[1]) if section_range[1] is not None else xb.shape[0]
+    section_mask[start_idx:end_idx] = True
     
-    xb[token_mask & section_mask] = replace_with
+    xb[token_mask & section_mask] = replacement_idx
     return xb

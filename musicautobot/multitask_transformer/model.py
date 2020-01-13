@@ -54,28 +54,11 @@ class MultiTransformer(nn.Module):
     def reset(self):
         for module in self.children(): 
             reset_children(module)
-            
-    def update_mem_len(self, use_mem):
-        # Only Next word predictions should have memory
-        next_mem_len = self.default_mem_len if use_mem else 0
-        if self.current_mem_len == next_mem_len: return
-        # print('Updating mem length to:', next_mem_len)
-        for module in self.children(): 
-            update_mem_len(module, next_mem_len)
-        self.current_mem_len = next_mem_len
-        self.reset()
-        
         
 def reset_children(mod):
     if hasattr(mod, 'reset'): mod.reset()
     for module in mod.children(): 
         reset_children(module)
-        
-def update_mem_len(mod, mem_len):
-    if hasattr(mod, 'mem_len'): mod.mem_len = mem_len
-    for module in mod.children(): 
-        update_mem_len(module, mem_len)
-
 
  # COMPONENTS
 class TransformerEmbedding(nn.Module):
@@ -130,7 +113,8 @@ class MTLinearDecoder(nn.Module):
 class MTEncoder(nn.Module):
     def __init__(self, embed:nn.Module, n_hid:int, n_layers:int, n_heads:int, d_model:int, d_head:int, d_inner:int, 
                  resid_p:float=0., attn_p:float=0., ff_p:float=0., bias:bool=True, scale:bool=True,
-                 act:Activation=Activation.ReLU, double_drop:bool=True, mem_len:int=512, is_decoder=False, **kwargs):
+                 act:Activation=Activation.ReLU, double_drop:bool=True, mem_len:int=512, is_decoder=False,
+                 mask_steps=1, mask_p=0.3, **kwargs):
         super().__init__()
         self.embed = embed
         self.u = nn.Parameter(torch.Tensor(n_heads, 1, d_head)) #Remove 1 for einsum implementation of attention
@@ -140,7 +124,7 @@ class MTEncoder(nn.Module):
                       ff_p=ff_p, bias=bias, scale=scale, act=act, double_drop=double_drop, mem_len=mem_len,
                       ) for k in range(n_layers)])
 
-        self.mask_size = 1
+        self.mask_steps, self.mask_p = mask_steps, mask_p
         self.is_decoder = is_decoder
     
         nn.init.normal_(self.u, 0., 0.02)
@@ -158,7 +142,7 @@ class MTEncoder(nn.Module):
         # Masks
         if self.is_decoder:
             lm_mask = rand_window_mask(lm_len, self.embed.mem_len, x_lm.device,
-                                       max_size=self.mask_size, p=0.3, is_eval=not self.training)
+                                       max_size=self.mask_steps, p=self.mask_p, is_eval=not self.training)
         else:
             lm_mask = None
         
@@ -171,11 +155,11 @@ class MTEncoderBlock(nn.Module):
     "Decoder block of a Transformer model."
     #Can't use Sequential directly cause more than one input...
     def __init__(self, n_heads:int, d_model:int, d_head:int, d_inner:int, resid_p:float=0., attn_p:float=0., ff_p:float=0.,
-                 bias:bool=True, scale:bool=True, double_drop:bool=True, mem_len:int=512, **kwargs):
+                 bias:bool=True, scale:bool=True, double_drop:bool=True, mem_len:int=512, mha2_mem_len=0, **kwargs):
         super().__init__()
         attn_cls = MemMultiHeadRelativeAttentionKV
         self.mha1 = attn_cls(n_heads, d_model, d_head, resid_p=resid_p, attn_p=attn_p, bias=bias, scale=scale, mem_len=mem_len, r_mask=False)
-        self.mha2 = attn_cls(n_heads, d_model, d_head, resid_p=resid_p, attn_p=attn_p, bias=bias, scale=scale, mem_len=mem_len, r_mask=True)
+        self.mha2 = attn_cls(n_heads, d_model, d_head, resid_p=resid_p, attn_p=attn_p, bias=bias, scale=scale, mem_len=mha2_mem_len, r_mask=True)
         self.ff   = feed_forward(d_model, d_inner, ff_p=ff_p, double_drop=double_drop)
     
     def forward(self, enc_lm:Tensor, enc_msk:Tensor,
@@ -267,6 +251,7 @@ class MemMultiHeadRelativeAttentionKV(nn.Module):
         if self.scale: attn_score = (AC + BD).mul_(1/(self.d_head ** 0.5))
         if mask is not None: 
             mask = mask[...,-seq_len:]
+            if hasattr(mask, 'bool'): mask = mask.bool()
             attn_score = attn_score.float().masked_fill(mask, -float('inf')).type_as(attn_score)
         attn_prob = self.drop_att(F.softmax(attn_score, dim=-1))
         attn_vec = torch.matmul(attn_prob, wv)

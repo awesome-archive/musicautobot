@@ -15,7 +15,7 @@ def setup_musescore(musescore_path=None):
     if musescore_path is None:
         if system == 'Darwin':
             app_paths = list(Path('/Applications').glob('MuseScore *.app'))
-            if len(musescore_app): musescore_path = app_paths[-1]/'Contents/MacOS/mscore'
+            if len(app_paths): musescore_path = app_paths[-1]/'Contents/MacOS/mscore'
         elif system == 'Linux':
             musescore_path = '/usr/bin/musescore'
     
@@ -29,3 +29,18 @@ def is_ipython():
     try: get_ipython
     except: return False
     return True
+
+def is_colab():
+    try: import google.colab
+    except: return False
+    return True
+
+def setup_fluidsynth():
+    from midi2audio import FluidSynth
+    from IPython.display import Audio
+
+def play_wav(stream):
+    out_midi = stream.write('midi')
+    out_wav = str(Path(out_midi).with_suffix('.wav'))
+    FluidSynth("font.sf2").midi_to_audio(out_midi, out_wav)
+    return Audio(out_wav)
